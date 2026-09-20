@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, call, patch
 
 import pytest
 import requests
+from atlassian.errors import ApiValueError
 from requests import HTTPError
 
 from mcp_atlassian.confluence.search import SearchMixin
@@ -258,15 +259,51 @@ class TestSearchMixin:
         be silently treated as an empty result set. Only a genuine
         ``{"results": []}`` response should return an empty list.
         """
-        # Mock a response missing the required "results" key from both
-        # the primary endpoint and the fallback
+        # Mock a response missing the required "results" key
         search_mixin.confluence.cql.return_value = {"incomplete": "data"}
-        search_mixin.confluence.get.return_value = {"incomplete": "data"}
 
         with pytest.raises(
             ValueError, match="Error processing search results.*malformed response"
         ):
             search_mixin.search("invalid query")
+
+        search_mixin.confluence.get.assert_not_called()
+
+    def test_search_falls_back_on_wrapped_html_bad_request(self, search_mixin):
+        """Fall back for the exception shape emitted by client version 4.0.7."""
+        response = requests.Response()
+        response.status_code = 400
+        response.headers["Content-Type"] = "text/html; charset=utf-8"
+        response._content = b"<!DOCTYPE html><html><body>Bad request</body></html>"
+        http_error = HTTPError("400 Client Error", response=response)
+        search_mixin.confluence.cql.side_effect = ApiValueError(
+            "The query cannot be parsed", reason=http_error
+        )
+        search_mixin.confluence.get.return_value = {
+            "results": [
+                {
+                    "id": "999",
+                    "title": "Fallback Page",
+                    "type": "page",
+                    "space": {"key": "TEST", "name": "Test Space"},
+                    "version": {"number": 1},
+                }
+            ]
+        }
+
+        result = search_mixin.search("test query")
+
+        search_mixin.confluence.get.assert_called_once_with(
+            "rest/api/content/search",
+            params={
+                "cql": "test query",
+                "limit": 10,
+                "expand": "history,version",
+            },
+        )
+        assert len(result) == 1
+        assert result[0].id == "999"
+        assert result[0].title == "Fallback Page"
 
     def test_search_falls_back_to_content_search_on_html_response(self, search_mixin):
         """Test fallback to /rest/api/content/search when cql() returns HTML.
@@ -308,37 +345,24 @@ class TestSearchMixin:
         assert result[0].id == "999"
         assert result[0].title == "Fallback Page"
 
-    def test_search_falls_back_on_dict_without_results_key(self, search_mixin):
-        """Test fallback when cql() returns a dict missing 'results'.
+    def test_search_preserves_json_invalid_cql_error(self, search_mixin):
+        """Do not mask a normal JSON HTTP 400 caused by invalid CQL."""
+        response = requests.Response()
+        response.status_code = 400
+        response.headers["Content-Type"] = "application/json"
+        response._content = b'{"message":"Invalid CQL"}'
+        http_error = HTTPError("400 Client Error", response=response)
+        search_mixin.confluence.cql.side_effect = ApiValueError(
+            "The query cannot be parsed", reason=http_error
+        )
 
-        This covers cases where the primary endpoint returns a JSON error
-        object (e.g. {"statusCode": 400, "message": "..."}) instead of
-        search results.
-        """
-        # Primary endpoint returns a JSON error (dict but no "results")
-        search_mixin.confluence.cql.return_value = {
-            "statusCode": 400,
-            "message": "siteSearch is not supported",
-        }
+        with pytest.raises(
+            RuntimeError,
+            match="Unexpected error during search: The query cannot be parsed",
+        ):
+            search_mixin.search("not valid cql")
 
-        # Fallback endpoint returns valid results
-        search_mixin.confluence.get.return_value = {
-            "results": [
-                {
-                    "id": "888",
-                    "title": "Another Page",
-                    "type": "page",
-                    "space": {"key": "DEV", "name": "Dev Space"},
-                    "version": {"number": 2},
-                }
-            ]
-        }
-
-        result = search_mixin.search("my query")
-
-        search_mixin.confluence.get.assert_called_once()
-        assert len(result) == 1
-        assert result[0].id == "888"
+        search_mixin.confluence.get.assert_not_called()
 
     def test_search_request_exception(self, search_mixin):
         """Test handling of RequestException during search."""
