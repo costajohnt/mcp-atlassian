@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, call, patch
 
 import pytest
 import requests
-from atlassian.errors import ApiValueError
+from atlassian import Confluence
 from requests import HTTPError
 
 from mcp_atlassian.confluence.search import SearchMixin
@@ -270,16 +270,13 @@ class TestSearchMixin:
         search_mixin.confluence.get.assert_not_called()
 
     def test_search_falls_back_on_wrapped_html_bad_request(self, search_mixin):
-        """Fall back for the exception shape emitted by client version 4.0.7."""
+        """Fall back for the exception flow emitted by client version 4.0.7."""
         response = requests.Response()
         response.status_code = 400
         response.headers["Content-Type"] = "text/html; charset=utf-8"
         response._content = b"<!DOCTYPE html><html><body>Bad request</body></html>"
         http_error = HTTPError("400 Client Error", response=response)
-        search_mixin.confluence.cql.side_effect = ApiValueError(
-            "The query cannot be parsed", reason=http_error
-        )
-        search_mixin.confluence.get.return_value = {
+        fallback_response = {
             "results": [
                 {
                     "id": "999",
@@ -291,16 +288,35 @@ class TestSearchMixin:
             ]
         }
 
+        # Exercise the pinned client's real cql() implementation instead of
+        # manufacturing the outer exception in this test. It catches the first
+        # HTTPError below and wraps it in ApiValueError(reason=http_error).
+        search_mixin.confluence.get.side_effect = [http_error, fallback_response]
+        search_mixin.confluence.cql.side_effect = lambda **kwargs: Confluence.cql(
+            search_mixin.confluence, **kwargs
+        )
+
         result = search_mixin.search("test query")
 
-        search_mixin.confluence.get.assert_called_once_with(
-            "rest/api/content/search",
-            params={
-                "cql": "test query",
-                "limit": 10,
-                "expand": "history,version",
-            },
-        )
+        assert search_mixin.confluence.get.call_args_list == [
+            call(
+                "rest/api/search",
+                params={
+                    "start": 0,
+                    "limit": 10,
+                    "cql": "test query",
+                    "expand": "content.history,content.version",
+                },
+            ),
+            call(
+                "rest/api/content/search",
+                params={
+                    "cql": "test query",
+                    "limit": 10,
+                    "expand": "history,version",
+                },
+            ),
+        ]
         assert len(result) == 1
         assert result[0].id == "999"
         assert result[0].title == "Fallback Page"
@@ -352,8 +368,9 @@ class TestSearchMixin:
         response.headers["Content-Type"] = "application/json"
         response._content = b'{"message":"Invalid CQL"}'
         http_error = HTTPError("400 Client Error", response=response)
-        search_mixin.confluence.cql.side_effect = ApiValueError(
-            "The query cannot be parsed", reason=http_error
+        search_mixin.confluence.get.side_effect = http_error
+        search_mixin.confluence.cql.side_effect = lambda **kwargs: Confluence.cql(
+            search_mixin.confluence, **kwargs
         )
 
         with pytest.raises(
@@ -362,7 +379,15 @@ class TestSearchMixin:
         ):
             search_mixin.search("not valid cql")
 
-        search_mixin.confluence.get.assert_not_called()
+        search_mixin.confluence.get.assert_called_once_with(
+            "rest/api/search",
+            params={
+                "start": 0,
+                "limit": 10,
+                "cql": "not valid cql",
+                "expand": "content.history,content.version",
+            },
+        )
 
     def test_search_request_exception(self, search_mixin):
         """Test handling of RequestException during search."""
