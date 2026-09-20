@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, call, patch
 import pytest
 import requests
 from atlassian import Confluence
+from atlassian.errors import ApiValueError
 from requests import HTTPError
 
 from mcp_atlassian.confluence.search import SearchMixin
@@ -269,8 +270,43 @@ class TestSearchMixin:
 
         search_mixin.confluence.get.assert_not_called()
 
-    def test_search_falls_back_on_wrapped_html_bad_request(self, search_mixin):
-        """Fall back for the exception flow emitted by client version 4.0.7."""
+    def test_search_falls_back_on_explicit_api_value_error(self, search_mixin):
+        """Fall back for an ApiValueError wrapping an HTML HTTP 400."""
+        response = requests.Response()
+        response.status_code = 400
+        response.headers["Content-Type"] = "text/html; charset=utf-8"
+        response._content = b"<!DOCTYPE html><html><body>Bad request</body></html>"
+        http_error = HTTPError("400 Client Error", response=response)
+        search_mixin.confluence.cql.side_effect = ApiValueError(
+            "The query cannot be parsed", reason=http_error
+        )
+        search_mixin.confluence.get.return_value = {
+            "results": [
+                {
+                    "id": "999",
+                    "title": "Fallback Page",
+                    "type": "page",
+                    "space": {"key": "TEST", "name": "Test Space"},
+                    "version": {"number": 1},
+                }
+            ]
+        }
+
+        result = search_mixin.search("test query")
+
+        search_mixin.confluence.get.assert_called_once_with(
+            "rest/api/content/search",
+            params={
+                "cql": "test query",
+                "limit": 10,
+                "expand": "history,version",
+            },
+        )
+        assert len(result) == 1
+        assert result[0].id == "999"
+
+    def test_search_falls_back_through_client_http_error(self, search_mixin):
+        """Fall back through the HTTPError flow in client version 4.0.7."""
         response = requests.Response()
         response.status_code = 400
         response.headers["Content-Type"] = "text/html; charset=utf-8"
